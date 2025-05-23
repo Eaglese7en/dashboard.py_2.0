@@ -1,92 +1,77 @@
 import streamlit as st
+from streamlit_lottie import st_lottie
 import pandas as pd
 import sqlite3
-from contextlib import closing
-from pathlib import Path
 import requests
-import smtplib
-from email.mime.base import MIMEBase
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
-from email import encoders
+from datetime import date
 
-# -------------------------------------------------
-# Configurações Gerais
-# -------------------------------------------------
-st.set_page_config(
-    page_title="Oficina Dashboard",
-    page_icon="🚗",
-    layout="wide",
+# -----------------------------------------------------------------------------
+# Configuração da página e estilo rápido
+# -----------------------------------------------------------------------------
+st.set_page_config(page_title="Dashboard Oficina", page_icon="🚗", layout="wide")
+
+st.markdown(
+    """
+    <style>
+        h1, h2, h3 {color:#0A66C2;}
+        /* deixa as tabelas roláveis se ficarem grandes */
+        .dataframe-container {max-height:500px; overflow:auto;}
+        [data-testid="stSidebar"] > div:first-child {padding-top: 1rem;}
+    </style>
+    """,
+    unsafe_allow_html=True,
 )
 
-DB_PATH = "workshop.db"
-ARQUIVOS_DIR = Path("relatorios")
-ARQUIVOS_DIR.mkdir(exist_ok=True)
+DB_PATH = "client_data.db"
 
-# -------------------------------------------------
-# Utilidades de Conexão
-# -------------------------------------------------
-@st.cache_resource(show_spinner=False)
-def get_connection():
-    """Retorna uma conexão SQLite cacheada."""
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    conn.row_factory = sqlite3.Row  # acesso por nome
-    return conn
-
-
-def ensure_column(cursor, table: str, column: str, ddl: str):
-    """Garante que uma coluna exista; se não existir, adiciona."""
-    cursor.execute(f"PRAGMA table_info({table})")
-    if column not in [row[1] for row in cursor.fetchall()]:
-        cursor.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
-
+# -----------------------------------------------------------------------------
+# Banco de dados
+# -----------------------------------------------------------------------------
 
 def init_db():
-    """Cria as tabelas do banco, caso ainda não existam e adiciona colunas de data."""
-    with closing(get_connection()) as conn:
+    with sqlite3.connect(DB_PATH) as conn:
         cur = conn.cursor()
-        # Tabelas
-        cur.execute(
-            """CREATE TABLE IF NOT EXISTS clientes (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    nome TEXT NOT NULL,
-                    telefone TEXT
-            )"""
-        )
-        cur.execute(
-            """CREATE TABLE IF NOT EXISTS carros (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    cliente_id INTEGER,
-                    modelo TEXT,
-                    ano INTEGER,
-                    cor TEXT,
-                    status TEXT DEFAULT 'Em revisão',
-                    FOREIGN KEY(cliente_id) REFERENCES clientes(id)
-            )"""
-        )
-        cur.execute(
-            """CREATE TABLE IF NOT EXISTS orcamentos (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    carro_id INTEGER,
-                    servico TEXT,
-                    preco_estimado REAL,
-                    preco_final REAL,
-                    FOREIGN KEY(carro_id) REFERENCES carros(id)
-            )"""
-        )
-        # Colunas de data (adiciona se não existir)
-        ensure_column(cur, "clientes", "criado_em", "TEXT DEFAULT (datetime('now','localtime'))")
-        ensure_column(cur, "carros", "criado_em", "TEXT DEFAULT (datetime('now','localtime'))")
-        ensure_column(cur, "orcamentos", "criado_em", "TEXT DEFAULT (datetime('now','localtime'))")
+        cur.execute("""CREATE TABLE IF NOT EXISTS clientes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                nome TEXT,
+                email TEXT,
+                telefone TEXT
+        )""")
+        cur.execute("""CREATE TABLE IF NOT EXISTS carros (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                cliente_id INTEGER,
+                modelo TEXT,
+                placa TEXT,
+                FOREIGN KEY(cliente_id) REFERENCES clientes(id)
+        )""")
+        cur.execute("""CREATE TABLE IF NOT EXISTS orcamentos (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                cliente_id INTEGER,
+                descricao TEXT,
+                valor REAL,
+                FOREIGN KEY(cliente_id) REFERENCES clientes(id)
+        )""")
+        cur.execute("""CREATE TABLE IF NOT EXISTS status (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                cliente_id INTEGER,
+                status_atual TEXT,
+                data_atualizacao DATE,
+                FOREIGN KEY(cliente_id) REFERENCES clientes(id)
+        )""")
+        cur.execute("""CREATE TABLE IF NOT EXISTS entregas (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                cliente_id INTEGER,
+                data_entrega DATE,
+                FOREIGN KEY(cliente_id) REFERENCES clientes(id)
+        )""")
         conn.commit()
 
-# -------------------------------------------------
-# Estilo e Animações opcionais
-# -------------------------------------------------
+# -----------------------------------------------------------------------------
+# Utilidades
+# -----------------------------------------------------------------------------
 
 def carregar_lottie(url: str):
     try:
-        from streamlit_lottie import st_lottie
         r = requests.get(url, timeout=5)
         if r.status_code == 200:
             return r.json()
@@ -95,230 +80,191 @@ def carregar_lottie(url: str):
     return None
 
 
-def apply_status_style(df: pd.DataFrame) -> pd.DataFrame.style:
-    colors = {
-        "Em revisão": "#F7DC6F",
-        "Pronto": "#82E0AA",
-        "Aguardando peças": "#F5B7B1",
+def selecionar_cliente(conn):
+    """Devolve (id, nome). Se não houver clientes, mostra aviso e retorna (None, "")."""
+    clientes = pd.read_sql_query("SELECT id, nome, telefone FROM clientes", conn)
+    if clientes.empty:
+        st.warning("Nenhum cliente cadastrado. Adicione clientes primeiro.")
+        return None, ""
+
+    opcoes = {
+        f"{row.nome} — {row.telefone or 'sem telefone'}": row.id for row in clientes.itertuples()
     }
-    def highlight(val):
-        color = colors.get(val, "#D5DBDB")
-        return f"background-color:{color};font-weight:600;"
-    return df.style.applymap(highlight, subset=["status"])
+    label = st.selectbox("Selecione o cliente", opcoes.keys())
+    return opcoes[label], label.split(" — ")[0]
 
-# -------------------------------------------------
-# Funções Auxiliares
-# -------------------------------------------------
-
-def enviar_email(destinatario: str, arquivo: Path, assunto: str):
-    """Envia um e‑mail com o arquivo em anexo usando credenciais em st.secrets."""
-    if "email" not in st.secrets:
-        st.warning("⚠️ Configure suas credenciais em .streamlit/secrets.toml para usar e‑mail.")
-        return
-    creds = st.secrets["email"]
-    msg = MIMEMultipart()
-    msg["From"] = creds["user"]
-    msg["To"] = destinatario
-    msg["Subject"] = assunto
-    msg.attach(MIMEText("Relatório diário gerado pela Oficina Dashboard.", "plain"))
-
-    part = MIMEBase("application", "octet-stream")
-    with open(arquivo, "rb") as f:
-        part.set_payload(f.read())
-    encoders.encode_base64(part)
-    part.add_header("Content-Disposition", f"attachment; filename={arquivo.name}")
-    msg.attach(part)
-
-    try:
-        with smtplib.SMTP(creds.get("smtp", "smtp.gmail.com"), int(creds.get("port", 587))) as server:
-            server.starttls()
-            server.login(creds["user"], creds["password"])
-            server.send_message(msg)
-        st.success("📧 E‑mail enviado com sucesso!")
-    except Exception as e:
-        st.error(f"Erro ao enviar e‑mail: {e}")
-
-# -------------------------------------------------
+# -----------------------------------------------------------------------------
 # Páginas
-# -------------------------------------------------
+# -----------------------------------------------------------------------------
 
 def pagina_inicio():
-    st.title("Dashboard da Oficina 🚗")
-    st.write("Acompanhe clientes, veículos e orçamentos em um único lugar.")
-    anim = carregar_lottie("https://assets9.lottiefiles.com/packages/lf20_tutvdkg0.json")
-    if anim:
-        from streamlit_lottie import st_lottie
-        st_lottie(anim, height=250, key="anim")
+    st.header("🚗 Dashboard da Oficina")
+    st.markdown("Gerencie clientes, veículos, orçamentos e entregas em um só lugar.")
+    lottie_json = carregar_lottie("https://lottie.host/01c2f244-7ed7-49cf-8c3f-6b89353626c7/CLfXsS5rvf.json")
+    if lottie_json:
+        st_lottie(lottie_json, height=250)
 
 
 def pagina_clientes():
-    st.header("📇 Clientes")
-    with st.form("form_cliente", clear_on_submit=True):
-        col1, col2 = st.columns(2)
-        nome = col1.text_input("Nome")
-        telefone = col2.text_input("Telefone")
-        if st.form_submit_button("Adicionar"):
-            if nome:
-                with closing(get_connection()) as conn:
-                    conn.execute("INSERT INTO clientes (nome, telefone) VALUES (?,?)", (nome, telefone))
+    st.subheader("📇 Clientes")
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.cursor()
+        with st.form("frm_cliente", clear_on_submit=True):
+            col1, col2, col3 = st.columns(3)
+            nome = col1.text_input("Nome")
+            email = col2.text_input("Email")
+            telefone = col3.text_input("Telefone")
+            if st.form_submit_button("Adicionar"):
+                if nome.strip():
+                    cur.execute("INSERT INTO clientes (nome,email,telefone) VALUES (?,?,?)", (nome,email,telefone))
                     conn.commit()
-                st.toast("Cliente adicionado!", icon="✅")
-    clientes = pd.read_sql("SELECT * FROM clientes", get_connection())
-    st.dataframe(clientes, use_container_width=True)
+                    st.success("Cliente adicionado!")
+                else:
+                    st.error("O nome é obrigatório.")
+
+        st.divider()
+        clientes = pd.read_sql_query("SELECT * FROM clientes", conn)
+        st.dataframe(clientes, use_container_width=True)
 
 
 def pagina_carros():
-    st.header("🚙 Veículos")
-    clientes = pd.read_sql("SELECT * FROM clientes", get_connection())
-    if clientes.empty:
-        st.info("Cadastre um cliente antes.")
-        return
-    with st.form("form_carro", clear_on_submit=True):
-        cliente_nome = st.selectbox("Cliente", clientes["nome"])
-        cliente_id = clientes.loc[clientes["nome"] == cliente_nome, "id"].iloc[0]
-        col1, col2 = st.columns(2)
-        modelo = col1.text_input("Modelo")
-        ano = col2.number_input("Ano", 1900, 2100, step=1, value=2023)
-        col3, col4 = st.columns(2)
-        cor = col3.text_input("Cor")
-        status = col4.selectbox("Status", ["Em revisão", "Pronto", "Aguardando peças"])
-        if st.form_submit_button("Adicionar"):
-            if modelo:
-                with closing(get_connection()) as conn:
-                    conn.execute("""
-                        INSERT INTO carros (cliente_id, modelo, ano, cor, status)
-                        VALUES (?,?,?,?,?)
-                    """, (cliente_id, modelo, ano, cor, status))
+    st.subheader("🚙 Veículos")
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.cursor()
+        cliente_id, _ = selecionar_cliente(conn)
+        if cliente_id is None:
+            return
+
+        with st.form("frm_carro", clear_on_submit=True):
+            col1, col2 = st.columns(2)
+            modelo = col1.text_input("Modelo")
+            placa = col2.text_input("Placa")
+            if st.form_submit_button("Registrar"):
+                if modelo.strip() and placa.strip():
+                    cur.execute("INSERT INTO carros (cliente_id,modelo,placa) VALUES (?,?,?)", (cliente_id,modelo,placa))
                     conn.commit()
-                st.toast("Veículo registrado!", icon="🚗")
-    carros = pd.read_sql("""
-        SELECT carros.id, clientes.nome AS cliente, modelo, ano, cor, status, criado_em
-        FROM carros JOIN clientes ON carros.cliente_id = clientes.id
-    """, get_connection())
-    st.dataframe(apply_status_style(carros), use_container_width=True)
+                    st.success("Carro registrado!")
+                else:
+                    st.error("Preencha modelo e placa.")
+
+        st.divider()
+        carros = pd.read_sql_query("SELECT id, modelo, placa FROM carros WHERE cliente_id = ?", conn, params=(cliente_id,))
+        st.dataframe(carros, use_container_width=True)
 
 
 def pagina_orcamentos():
-    st.header("💰 Orçamentos")
-    carros = pd.read_sql("SELECT id, modelo FROM carros", get_connection())
-    if carros.empty:
-        st.info("Nenhum veículo cadastrado.")
-        return
-    with st.form("form_orc", clear_on_submit=True):
-        modelo = st.selectbox("Modelo", carros["modelo"])
-        carro_id = carros.loc[carros["modelo"] == modelo, "id"].iloc[0]
-        servico = st.text_input("Serviço")
-        col1, col2 = st.columns(2)
-        preco_estimado = col1.number_input("Preço estimado", min_value=0.0)
-        preco_final = col2.number_input("Preço final", min_value=0.0)
-        if st.form_submit_button("Registrar orçamento"):
-            if servico:
-                with closing(get_connection()) as conn:
-                    conn.execute("""
-                        INSERT INTO orcamentos (carro_id, servico, preco_estimado, preco_final)
-                        VALUES (?,?,?,?)
-                    """, (carro_id, servico, preco_estimado, preco_final))
+    st.subheader("💰 Orçamentos")
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.cursor()
+        cliente_id, _ = selecionar_cliente(conn)
+        if cliente_id is None:
+            return
+
+        with st.form("frm_orc", clear_on_submit=True):
+            descricao = st.text_area("Descrição")
+            valor = st.number_input("Valor", min_value=0.0, format="%.2f")
+            if st.form_submit_button("Salvar"):
+                if descricao.strip():
+                    cur.execute("INSERT INTO orcamentos (cliente_id,descricao,valor) VALUES (?,?,?)", (cliente_id,descricao,valor))
                     conn.commit()
-                st.toast("Orçamento salvo!", icon="💸")
-    orc = pd.read_sql("""
-        SELECT orcamentos.id, modelo, servico, preco_estimado, preco_final, orcamentos.criado_em
-        FROM orcamentos JOIN carros ON orcamentos.carro_id = carros.id
-    """, get_connection())
-    st.dataframe(orc, use_container_width=True)
+                    st.success("Orçamento salvo!")
+                else:
+                    st.error("Descrição obrigatória.")
+
+        st.divider()
+        orcs = pd.read_sql_query("SELECT id, descricao, valor FROM orcamentos WHERE cliente_id = ?", conn, params=(cliente_id,))
+        st.dataframe(orcs, use_container_width=True)
 
 
 def pagina_status():
-    st.header("📊 Status da Oficina")
-    carros = pd.read_sql("SELECT * FROM carros", get_connection())
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Em revisão", len(carros[carros["status"] == "Em revisão"]))
-    col2.metric("Prontos", len(carros[carros["status"] == "Pronto"]))
-    col3.metric("Aguardando peças", len(carros[carros["status"] == "Aguardando peças"]))
-    st.dataframe(apply_status_style(carros), use_container_width=True)
+    st.subheader("📊 Status")
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.cursor()
+        cliente_id, _ = selecionar_cliente(conn)
+        if cliente_id is None:
+            return
+
+        with st.form("frm_status", clear_on_submit=True):
+            status_atual = st.text_input("Status atual")
+            data_atualizacao = st.date_input("Data", value=date.today())
+            if st.form_submit_button("Atualizar"):
+                if status_atual.strip():
+                    cur.execute("INSERT INTO status (cliente_id,status_atual,data_atualizacao) VALUES (?,?,?)", (cliente_id,status_atual,data_atualizacao))
+                    conn.commit()
+                    st.success("Status atualizado!")
+                else:
+                    st.error("Status obrigatório.")
+
+        st.divider()
+        df = pd.read_sql_query("SELECT status_atual, data_atualizacao FROM status WHERE cliente_id=?", conn, params=(cliente_id,))
+        st.dataframe(df, use_container_width=True)
 
 
 def pagina_entregas():
-    st.header("✅ Entregas")
-    carros_prontos = pd.read_sql("""
-        SELECT carros.id, clientes.nome AS cliente, modelo, ano, cor, carros.criado_em
-        FROM carros JOIN clientes ON carros.cliente_id = clientes.id
-        WHERE status='Pronto'
-    """, get_connection())
-    if carros_prontos.empty:
-        st.info("Nenhum veículo pronto para entrega.")
-        return
-    carros_prontos["desc"] = carros_prontos.apply(lambda r: f"{r['cliente']} – {r['modelo']} ({r['cor']})", axis=1)
-    selected = st.multiselect("Selecione os veículos entregues", carros_prontos["desc"].tolist())
-    if st.button("Remover selecionados") and selected:
-        ids = carros_prontos.loc[carros_prontos["desc"].isin(selected), "id"].tolist()
-        with closing(get_connection()) as conn:
-            for cid in ids:
-                conn.execute("DELETE FROM orcamentos WHERE carro_id=?", (cid,))
-                conn.execute("DELETE FROM carros WHERE id=?", (cid,))
-            conn.execute("""
-                DELETE FROM clientes 
-                WHERE id NOT IN (SELECT DISTINCT cliente_id FROM carros)
-            """)
-            conn.commit()
-        st.toast(f"Removidos {len(ids)} veículos e clientes relacionados (se aplicável).", icon="🗑️")
-        st.experimental_rerun()
-    st.dataframe(carros_prontos.drop(columns="desc"), use_container_width=True)
+    st.subheader("✅ Entregas")
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.cursor()
+        cliente_id, _ = selecionar_cliente(conn)
+        if cliente_id is None:
+            return
+
+        with st.form("frm_ent", clear_on_submit=True):
+            data_entrega = st.date_input("Data de entrega", value=date.today())
+            if st.form_submit_button("Registrar"):
+                cur.execute("INSERT INTO entregas (cliente_id,data_entrega) VALUES (?,?)", (cliente_id,data_entrega))
+                conn.commit()
+                st.success("Entrega registrada!")
+
+        st.divider()
+        ent = pd.read_sql_query("SELECT data_entrega FROM entregas WHERE cliente_id=?", conn, params=(cliente_id,))
+        st.dataframe(ent, use_container_width=True)
 
 
 def pagina_exportar():
-    st.header("📤 Exportar Dados")
-    conn = get_connection()
+    st.subheader("📤 Exportar dados")
+    with sqlite3.connect(DB_PATH) as conn:
+        clientes = pd.read_sql_query("SELECT * FROM clientes", conn)
+        carros = pd.read_sql_query("SELECT * FROM carros", conn)
+        orcamentos = pd.read_sql_query("SELECT * FROM orcamentos", conn)
+        status = pd.read_sql_query("SELECT * FROM status", conn)
+        entregas = pd.read_sql_query("SELECT * FROM entregas", conn)
 
-    # Filtros
-    col1, col2 = st.columns(2)
-    data_inicial = col1.date_input("Data inicial", pd.Timestamp.now())
-    data_final = col2.date_input("Data final", pd.Timestamp.now())
-    status_opcoes = ["Em revisão", "Pronto", "Aguardando peças"]
-    status_selecionados = st.multiselect("Filtrar status (opcional)", status_opcoes, default=status_opcoes)
+    with pd.ExcelWriter("dados_exportados.xlsx") as writer:
+        clientes.to_excel(writer, sheet_name="Clientes", index=False)
+        carros.to_excel(writer, sheet_name="Carros", index=False)
+        orcamentos.to_excel(writer, sheet_name="Orcamentos", index=False)
+        status.to_excel(writer, sheet_name="Status", index=False)
+        entregas.to_excel(writer, sheet_name="Entregas", index=False)
 
-    # Query com filtros (SQLite usa date() para extrair parte da data)
-    query_carros = """
-        SELECT carros.id, clientes.nome AS cliente, modelo, ano, cor, status, carros.criado_em
-        FROM carros JOIN clientes ON carros.cliente_id = clientes.id
-        WHERE date(carros.criado_em) BETWEEN ? AND ?
-    """
-    params = (data_inicial, data_final)
-    carros = pd.read_sql(query_carros, conn, params=params)
-    carros = carros[carros["status"].isin(status_selecionados)] if status_selecionados else carros
+    with open("dados_exportados.xlsx", "rb") as f:
+        st.download_button("Baixar Excel", f, file_name="dados_exportados.xlsx")
 
-    clientes = pd.read_sql("SELECT * FROM clientes WHERE date(criado_em) BETWEEN ? AND ?", conn, params=params)
-    orcamentos = pd.read_sql("SELECT * FROM orcamentos WHERE date(criado_em) BETWEEN ? AND ?", conn, params=params)
+# -----------------------------------------------------------------------------
+# Run
+# -----------------------------------------------------------------------------
+init_db()
 
-    # Exibir prévia
-    st.subheader("Pré‑visualização")
-    with st.expander("Clientes"):
-        st.dataframe(clientes, use_container_width=True)
-    with st.expander("Carros"):
-        st.dataframe(apply_status_style(carros), use_container_width=True)
-    with st.expander("Orçamentos"):
-        st.dataframe(orcamentos, use_container_width=True)
+menu = st.sidebar.radio("Navegar para:", [
+    "Início",
+    "Clientes",
+    "Veículos",
+    "Orçamentos",
+    "Status",
+    "Entregas",
+    "Exportar",
+])
 
-        # Gerar arquivo
-    data_str = f"{data_inicial}_a_{data_final}"
-    file_name = ARQUIVOS_DIR / f"relatorio_{data_str}.xlsx"
-
-    if st.button("Gerar arquivo Excel"):
-        with pd.ExcelWriter(file_name) as writer:
-            clientes.to_excel(writer, sheet_name="Clientes", index=False)
-            carros.to_excel(writer, sheet_name="Carros", index=False)
-            orcamentos.to_excel(writer, sheet_name="Orçamentos", index=False)
-        st.success("Arquivo gerado!")
-
-    # Download e envio por e‑mail
-    with open(file_name, "rb") as file:
-        st.download_button(
-            "📥 Baixar Excel", file, file_name.name, mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        )
-
-    col_dl, col_email = st.columns(2)
-    with col_email:
-        enviar = st.checkbox("Enviar por e‑mail")
-        if enviar:
-            email_dest = st.text_input("Destinatário")
-            if st.button("Enviar agora") and email_dest:
-                enviar_email(email_dest, file_name, f"Relatório Oficina {data_str}")
+if menu == "Início":
+    pagina_inicio()
+elif menu == "Clientes":
+    pagina_clientes()
+elif menu == "Veículos":
+    pagina_carros()
+elif menu == "Orçamentos":
+    pagina_orcamentos()
+elif menu == "Status":
+    pagina_status()
+elif menu == "Entregas":
+    pagina_entregas()
+elif menu == "Exportar":
+    pagina_exportar()
